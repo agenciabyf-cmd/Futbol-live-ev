@@ -1,3 +1,4 @@
+import time
 import streamlit as st
 import requests
 import pandas as pd
@@ -96,17 +97,8 @@ def format_stats_table(stats_raw: list) -> pd.DataFrame | None:
     return pd.DataFrame(rows)
 
 
-def analyze_with_gemini(
-    match_info: dict,
-    stats_df: pd.DataFrame | None,
-    events: list,
-    market: str,
-    odds: float,
-    bankroll: int,
-) -> str:
-    """Envía el contexto real del partido a Gemini para el análisis cuantitativo."""
-    client = genai.Client(api_key=GEMINI_API_KEY)
-
+def build_match_context(match_info: dict, stats_df: pd.DataFrame | None, events: list) -> str:
+    """Formatea el estado del partido, estadísticas y eventos clave para el prompt."""
     key_events = [
         f"Min {e['time']['elapsed']}' - {e['team']['name']}: {e['type']} ({e['detail']}) - {e['player']['name']}"
         for e in events
@@ -116,10 +108,7 @@ def analyze_with_gemini(
     stats_text = stats_df.to_markdown(index=False) if stats_df is not None else "Estadísticas no disponibles aún."
     events_text = "\n".join(key_events) if key_events else "Sin goles ni tarjetas rojas registradas."
 
-    prompt = f"""
-Actúa como un analista cuantitativo de apuestas deportivas en vivo. Evalúa el siguiente partido con rigor matemático (sin inventar datos):
-
-### Datos del Partido en Vivo
+    return f"""### Datos del Partido en Vivo
 - **Liga:** {match_info['league']}
 - **Partido:** {match_info['home']} {match_info['goals_home']} - {match_info['goals_away']} {match_info['away']}
 - **Minuto / Estado:** {match_info['elapsed']}' ({match_info['status']})
@@ -128,9 +117,54 @@ Actúa como un analista cuantitativo de apuestas deportivas en vivo. Evalúa el 
 {stats_text}
 
 ### Goles y Tarjetas Rojas
-{events_text}
+{events_text}"""
 
-### Apuesta a Evaluar
+
+def call_gemini_with_retry(prompt: str, max_retries: int = 3) -> str:
+    """Llama a Gemini con reintento automático ante saturación temporal (503/429)."""
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    wait_times = [3, 6, 10]
+    last_error = None
+
+    for attempt in range(max_retries):
+        try:
+            response = client.models.generate_content(
+                model="gemini-3.8-flash",
+                contents=prompt,
+                config=types.GenerateContentConfig(temperature=0.2),
+            )
+            return response.text
+        except Exception as e:
+            last_error = e
+            error_msg = str(e).upper()
+            is_transient = any(code in error_msg for code in ("503", "UNAVAILABLE", "429", "OVERLOADED"))
+            if is_transient and attempt < max_retries - 1:
+                delay = wait_times[attempt]
+                st.toast(f"Servidor ocupado (503). Reintentando en {delay}s... ({attempt + 2}/{max_retries})")
+                time.sleep(delay)
+            else:
+                raise last_error
+
+    raise last_error
+
+
+def analyze_new_bet(
+    match_info: dict,
+    stats_df: pd.DataFrame | None,
+    events: list,
+    market: str,
+    odds: float,
+    bankroll: int,
+) -> str:
+    """Evalúa valor esperado (+EV) y stake Quarter-Kelly para una nueva entrada."""
+    context = build_match_context(match_info, stats_df, events)
+    max_stake = int(bankroll * 0.03)
+
+    prompt = f"""Actúa como un analista cuantitativo de apuestas deportivas en vivo. Evalúa el siguiente partido con rigor matemático (sin inventar datos):
+
+{context}
+
+### Nueva Apuesta a Evaluar
 - **Mercado:** {market}
 - **Cuota ofrecida:** {odds}
 - **Bankroll actual:** ${bankroll:,} CLP
@@ -141,15 +175,45 @@ Actúa como un analista cuantitativo de apuestas deportivas en vivo. Evalúa el 
 3. **Valor Esperado ($EV$):** Calcula $\\text{{EV}} = (P \\times {odds}) - 1$ en porcentaje.
 4. **Veredicto y Stake:**
    - Si $EV \\le 0\\%$, indica explícitamente **NO APOSTAR ($0 CLP)**.
-   - Si $EV > 0\\%$, calcula el **Quarter-Kelly** (1/4 de Kelly) con tope estricto del **3% de la banca** (${int(bankroll * 0.03):,} CLP) y entrega el monto exacto en CLP.
+   - Si $EV > 0\\%$, calcula el **Quarter-Kelly** (1/4 de Kelly) con tope estricto del **3% de la banca** (${max_stake:,} CLP) y entrega el monto exacto en CLP.
 """
+    return call_gemini_with_retry(prompt)
 
-    response = client.models.generate_content(
-        model="gemini-3.8-flash",
-        contents=prompt,
-        config=types.GenerateContentConfig(temperature=0.2),
-    )
-    return response.text
+
+def analyze_cashout(
+    match_info: dict,
+    stats_df: pd.DataFrame | None,
+    events: list,
+    active_market: str,
+    stake: int,
+    original_odds: float,
+    cashout_offer: int,
+) -> str:
+    """Evalúa matemáticamente si conviene cerrar (Cash Out) o mantener una apuesta activa."""
+    context = build_match_context(match_info, stats_df, events)
+    potential_payout = int(round(stake * original_odds))
+
+    prompt = f"""Actúa como un analista cuantitativo de gestión de riesgo en apuestas deportivas en vivo. Evalúa si conviene tomar el Cash Out o mantener la posición activa:
+
+{context}
+
+### Posición Activa del Usuario
+- **Apuesta activa:** {active_market}
+- **Stake invertido:** ${stake:,} CLP
+- **Cuota original:** {original_odds}
+- **Pago potencial si gana:** ${potential_payout:,} CLP
+- **Oferta de Cash Out actual:** ${cashout_offer:,} CLP
+
+### Entregable Requerido
+1. **Lectura de riesgo en cancha (máx. 3 puntos):** Evalúa si el trámite actual (xG, tiros al arco, presión, tarjetas, minuto) favorece o amenaza la apuesta activa.
+2. **Probabilidad real de cobro ($P$):** Estima la probabilidad real de que la apuesta termine ganando en el tiempo restante.
+3. **Comparativa Financiera Exacta:**
+   - **Valor Esperado de Mantener (Hold EV):** $P \\times {potential_payout:,}$ CLP.
+   - **Oferta de Cash Out:** ${cashout_offer:,} CLP.
+   - **Diferencia (Comisión implícita de la casa):** $\\text{{Hold EV}} - \\text{{Cash Out}}$ en CLP y porcentaje.
+4. **Veredicto Claro:** Indica explícitamente **MANTENER POSICIÓN** o **TOMAR CASH OUT**, justificando la decisión desde la esperanza matemática y el riesgo de varianza en los minutos finales.
+"""
+    return call_gemini_with_retry(prompt)
 
 
 # ================= INTERFAZ DE USUARIO =================
@@ -166,6 +230,7 @@ if st.button("🔄 Cargar partidos en vivo", use_container_width=True):
     with st.spinner("Consultando API-Football..."):
         try:
             st.session_state["live_matches"] = get_live_fixtures(only_top_leagues=only_top)
+            st.session_state.pop("cached_stats", None)
             if not st.session_state["live_matches"]:
                 st.warning("No hay partidos en vivo en este momento con el filtro seleccionado.")
         except Exception as e:
@@ -185,44 +250,161 @@ if "live_matches" in st.session_state and st.session_state["live_matches"]:
 
     selected_label = st.selectbox("Selecciona el partido:", list(options.keys()))
     selected_match = options[selected_label]
+    fixture_id = selected_match["fixture"]["id"]
+
+    match_info = {
+        "league": selected_match["league"]["name"],
+        "home": selected_match["teams"]["home"]["name"],
+        "away": selected_match["teams"]["away"]["name"],
+        "goals_home": selected_match["goals"]["home"],
+        "goals_away": selected_match["goals"]["away"],
+        "elapsed": selected_match["fixture"]["status"]["elapsed"],
+        "status": selected_match["fixture"]["status"]["short"],
+    }
+
+    # Botón dedicado para refrescar estadísticas sin repetir gasto innecesario
+    cached = st.session_state.get("cached_stats")
+    has_current_stats = cached is not None and cached["fixture_id"] == fixture_id
+
+    btn_label = "📊 Actualizar estadísticas del partido" if has_current_stats else "📊 Cargar estadísticas del partido"
+    if st.button(btn_label, use_container_width=True):
+        with st.spinner("Descargando estadísticas en vivo..."):
+            try:
+                stats_raw, events = get_match_details(fixture_id)
+                stats_df = format_stats_table(stats_raw)
+                st.session_state["cached_stats"] = {
+                    "fixture_id": fixture_id,
+                    "stats_df": stats_df,
+                    "events": events,
+                }
+                has_current_stats = True
+            except Exception as e:
+                st.error(f"Error al obtener estadísticas: {e}")
+
+    if has_current_stats:
+        stats_df = st.session_state["cached_stats"]["stats_df"]
+        if stats_df is not None:
+            st.dataframe(stats_df, hide_index=True, use_container_width=True)
+        else:
+            st.info("API-Football aún no publica estadísticas detalladas para este partido.")
 
     st.divider()
 
-    c1, c2 = st.columns([2, 1])
-    with c1:
-        market_input = st.text_input("Mercado a evaluar", placeholder="Ej: Más de 2.5 goles, Gana Local, Cash Out...")
-    with c2:
-        odds_input = st.number_input("Tu Cuota", min_value=1.01, max_value=50.0, value=1.50, step=0.01)
+    # Pestañas: Nueva Apuesta (+EV) y Evaluación de Cash Out
+    tab_ev, tab_cashout = st.tabs(["📈 Nueva Apuesta (+EV)", "💰 Evaluar Cash Out"])
 
-    if st.button("🧠 Analizar con Gemini (+EV)", type="primary", use_container_width=True):
-        if not market_input.strip():
-            st.warning("Escribe el mercado que quieres evaluar antes de analizar.")
-        else:
-            fixture_id = selected_match["fixture"]["id"]
-            match_info = {
-                "league": selected_match["league"]["name"],
-                "home": selected_match["teams"]["home"]["name"],
-                "away": selected_match["teams"]["away"]["name"],
-                "goals_home": selected_match["goals"]["home"],
-                "goals_away": selected_match["goals"]["away"],
-                "elapsed": selected_match["fixture"]["status"]["elapsed"],
-                "status": selected_match["fixture"]["status"]["short"],
-            }
+    with tab_ev:
+        c1, c2 = st.columns([2, 1])
+        with c1:
+            market_input = st.text_input(
+                "Mercado a evaluar",
+                placeholder="Ej: Más de 2.5 goles, Gana Local...",
+                key="ev_market",
+            )
+        with c2:
+            odds_input = st.number_input(
+                "Tu Cuota",
+                min_value=1.01,
+                max_value=50.0,
+                value=1.50,
+                step=0.01,
+                key="ev_odds",
+            )
 
-            with st.spinner("Extrayendo estadísticas y calculando probabilidades..."):
-                try:
-                    stats_raw, events = get_match_details(fixture_id)
-                    stats_df = format_stats_table(stats_raw)
+        if st.button("🧠 Analizar Nueva Apuesta (+EV)", type="primary", use_container_width=True):
+            if not market_input.strip():
+                st.warning("Escribe el mercado que quieres evaluar antes de analizar.")
+            else:
+                with st.spinner("Calculando probabilidades y valor esperado..."):
+                    try:
+                        # Si no se cargaron estadísticas aún, las obtiene automáticamente una sola vez
+                        if not has_current_stats:
+                            stats_raw, events = get_match_details(fixture_id)
+                            stats_df = format_stats_table(stats_raw)
+                            st.session_state["cached_stats"] = {
+                                "fixture_id": fixture_id,
+                                "stats_df": stats_df,
+                                "events": events,
+                            }
+                            if stats_df is not None:
+                                st.dataframe(stats_df, hide_index=True, use_container_width=True)
 
-                    if stats_df is not None:
-                        st.subheader("📊 Estadísticas en Vivo")
-                        st.dataframe(stats_df, hide_index=True, use_container_width=True)
+                        cached_now = st.session_state["cached_stats"]
+                        analysis = analyze_new_bet(
+                            match_info,
+                            cached_now["stats_df"],
+                            cached_now["events"],
+                            market_input,
+                            odds_input,
+                            bankroll,
+                        )
+                        st.subheader("📈 Diagnóstico Cuantitativo")
+                        st.markdown(analysis)
+                    except Exception as e:
+                        st.error(f"Ocurrió un error en el análisis: {e}")
 
-                    analysis = analyze_with_gemini(
-                        match_info, stats_df, events, market_input, odds_input, bankroll
-                    )
-                    st.subheader("📈 Diagnóstico Cuantitativo")
-                    st.markdown(analysis)
+    with tab_cashout:
+        active_market = st.text_input(
+            "Tu apuesta activa",
+            placeholder="Ej: Manchester City gana, Más de 1.5 goles...",
+            key="co_market",
+        )
+        col_a, col_b = st.columns(2)
+        with col_a:
+            stake_input = st.number_input(
+                "Stake apostado (CLP)",
+                min_value=100,
+                value=3000,
+                step=500,
+                key="co_stake",
+            )
+            orig_odds = st.number_input(
+                "Cuota original",
+                min_value=1.01,
+                max_value=100.0,
+                value=1.50,
+                step=0.01,
+                key="co_odds",
+            )
+        with col_b:
+            potential_win = int(round(stake_input * orig_odds))
+            st.metric("Pago potencial si gana", f"${potential_win:,} CLP")
+            cashout_offer = st.number_input(
+                "Oferta Cash Out (CLP)",
+                min_value=0,
+                value=int(stake_input),
+                step=100,
+                key="co_offer",
+            )
 
-                except Exception as e:
-                    st.error(f"Ocurrió un error en el análisis: {e}")
+        if st.button("💰 Evaluar Cash Out con Gemini", type="primary", use_container_width=True):
+            if not active_market.strip():
+                st.warning("Indica cuál es tu apuesta activa antes de evaluar el Cash Out.")
+            else:
+                with st.spinner("Evaluando riesgo y valor justo de cierre..."):
+                    try:
+                        if not has_current_stats:
+                            stats_raw, events = get_match_details(fixture_id)
+                            stats_df = format_stats_table(stats_raw)
+                            st.session_state["cached_stats"] = {
+                                "fixture_id": fixture_id,
+                                "stats_df": stats_df,
+                                "events": events,
+                            }
+                            if stats_df is not None:
+                                st.dataframe(stats_df, hide_index=True, use_container_width=True)
+
+                        cached_now = st.session_state["cached_stats"]
+                        co_analysis = analyze_cashout(
+                            match_info,
+                            cached_now["stats_df"],
+                            cached_now["events"],
+                            active_market,
+                            stake_input,
+                            orig_odds,
+                            cashout_offer,
+                        )
+                        st.subheader("💰 Diagnóstico de Cash Out")
+                        st.markdown(co_analysis)
+                    except Exception as e:
+                        st.error(f"Ocurrió un error al evaluar el Cash Out: {e}")
