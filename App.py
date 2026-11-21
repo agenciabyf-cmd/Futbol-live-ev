@@ -27,6 +27,39 @@ TOP_LEAGUES = {
 }
 
 
+@st.cache_data(ttl=3600)
+def get_available_gemini_models() -> list[str]:
+    """Consulta los modelos Gemini habilitados en tu cuenta (cacheado 1 hora)."""
+    fallback = ["gemini-3.8-flash"]
+    try:
+        client = genai.Client(
+            api_key=GEMINI_API_KEY,
+            http_options=types.HttpOptions(timeout=15000),
+        )
+        models = []
+        excluded = ("embedding", "aqa", "imagen", "veo", "tts", "audio", "robotics", "vision")
+        for m in client.models.list():
+            name = (m.name or "").replace("models/", "")
+            lower_name = name.lower()
+            if "gemini" not in lower_name or any(word in lower_name for word in excluded):
+                continue
+            actions = getattr(m, "supported_actions", None) or []
+            if actions and "generateContent" not in actions:
+                continue
+            models.append(name)
+
+        if not models:
+            return fallback
+
+        models = sorted(set(models), reverse=True)
+        if "gemini-3.8-flash" in models:
+            models.remove("gemini-3.8-flash")
+            models.insert(0, "gemini-3.8-flash")
+        return models
+    except Exception:
+        return fallback
+
+
 def get_live_fixtures(only_top_leagues: bool = True) -> list:
     """Obtiene los partidos en juego (consume 1 petición)."""
     resp = requests.get(
@@ -119,14 +152,14 @@ def build_match_context(match_info: dict, stats_df: pd.DataFrame | None, events:
 {events_text}"""
 
 
-def stream_gemini(prompt: str):
-    """Genera la respuesta de Gemini en streaming con timeout estricto de 25 segundos."""
+def stream_gemini(prompt: str, model_name: str):
+    """Genera la respuesta de Gemini en streaming con timeout de 60 segundos."""
     client = genai.Client(
         api_key=GEMINI_API_KEY,
-        http_options=types.HttpOptions(timeout=25000),
+        http_options=types.HttpOptions(timeout=60000),
     )
     response_stream = client.models.generate_content_stream(
-        model="gemini-3.8-flash",
+        model=model_name,
         contents=prompt,
         config=types.GenerateContentConfig(temperature=0.2),
     )
@@ -227,6 +260,16 @@ with col2:
     st.write("")
     only_top = st.toggle("Solo Ligas Top", value=True)
 
+# Selector automático de modelo Gemini
+available_models = get_available_gemini_models()
+with st.expander("⚙️ Modelo de IA (cambiar si hay saturación)", expanded=False):
+    selected_model = st.selectbox(
+        "Modelo API de Gemini:",
+        options=available_models,
+        index=0,
+    )
+    st.caption("Si un modelo arroja 503 o demora demasiado, cambia a otra versión Flash/Lite aquí o usa el botón de copiado para tu app de Gemini Pro.")
+
 if st.button("🔄 Cargar partidos en vivo", use_container_width=True):
     with st.spinner("Consultando API-Football..."):
         try:
@@ -310,7 +353,13 @@ if "live_matches" in st.session_state and st.session_state["live_matches"]:
                 key="ev_odds",
             )
 
-        if st.button("🧠 Analizar Nueva Apuesta (+EV)", type="primary", use_container_width=True):
+        b1, b2 = st.columns(2)
+        with b1:
+            run_ev_api = st.button("🧠 Analizar aquí (API)", type="primary", use_container_width=True)
+        with b2:
+            gen_ev_copy = st.button("📋 Copiar a Gemini Pro", use_container_width=True)
+
+        if run_ev_api:
             if not market_input.strip():
                 st.warning("Escribe el mercado que quieres evaluar antes de analizar.")
             else:
@@ -324,11 +373,30 @@ if "live_matches" in st.session_state and st.session_state["live_matches"]:
                         odds_input,
                         bankroll,
                     )
-                    st.subheader("📈 Diagnóstico Cuantitativo")
-                    st.write_stream(stream_gemini(prompt))
+                    st.subheader(f"📈 Diagnóstico ({selected_model})")
+                    st.write_stream(stream_gemini(prompt, selected_model))
                 except Exception as e:
-                    st.error(f"Gemini no respondió a tiempo o está saturado: {e}")
-                    st.info("Tus estadísticas ya están guardadas en memoria. Espera 10 segundos y vuelve a tocar el botón sin gastar peticiones de API-Football.")
+                    st.error(f"La API no respondió a tiempo o está saturada: {e}")
+                    st.info("Prueba cambiar el modelo arriba en ⚙️ Modelo de IA, o toca '📋 Copiar a Gemini Pro' para analizarlo al instante en tu app.")
+
+        if gen_ev_copy:
+            if not market_input.strip():
+                st.warning("Escribe el mercado que quieres evaluar antes de generar el texto.")
+            else:
+                try:
+                    cached_now = ensure_stats_loaded(fixture_id)
+                    prompt = build_new_bet_prompt(
+                        match_info,
+                        cached_now["stats_df"],
+                        cached_now["events"],
+                        market_input,
+                        odds_input,
+                        bankroll,
+                    )
+                    st.success("Toca el ícono de copiar (arriba a la derecha de la caja) y pégalo en tu app de Gemini Pro:")
+                    st.code(prompt, language="markdown")
+                except Exception as e:
+                    st.error(f"Error al cargar estadísticas: {e}")
 
     with tab_cashout:
         active_market = st.text_input(
@@ -364,7 +432,13 @@ if "live_matches" in st.session_state and st.session_state["live_matches"]:
                 key="co_offer",
             )
 
-        if st.button("💰 Evaluar Cash Out con Gemini", type="primary", use_container_width=True):
+        cb1, cb2 = st.columns(2)
+        with cb1:
+            run_co_api = st.button("💰 Evaluar aquí (API)", type="primary", use_container_width=True)
+        with cb2:
+            gen_co_copy = st.button("📋 Copiar a Gemini Pro", key="co_copy_btn", use_container_width=True)
+
+        if run_co_api:
             if not active_market.strip():
                 st.warning("Indica cuál es tu apuesta activa antes de evaluar el Cash Out.")
             else:
@@ -379,8 +453,28 @@ if "live_matches" in st.session_state and st.session_state["live_matches"]:
                         orig_odds,
                         cashout_offer,
                     )
-                    st.subheader("💰 Diagnóstico de Cash Out")
-                    st.write_stream(stream_gemini(prompt))
+                    st.subheader(f"💰 Diagnóstico Cash Out ({selected_model})")
+                    st.write_stream(stream_gemini(prompt, selected_model))
                 except Exception as e:
-                    st.error(f"Gemini no respondió a tiempo o está saturado: {e}")
-                    st.info("Tus estadísticas ya están guardadas en memoria. Espera 10 segundos y vuelve a tocar el botón sin gastar peticiones de API-Football.")
+                    st.error(f"La API no respondió a tiempo o está saturada: {e}")
+                    st.info("Prueba cambiar el modelo en ⚙️ Modelo de IA, o toca '📋 Copiar a Gemini Pro'.")
+
+        if gen_co_copy:
+            if not active_market.strip():
+                st.warning("Indica cuál es tu apuesta activa antes de generar el texto.")
+            else:
+                try:
+                    cached_now = ensure_stats_loaded(fixture_id)
+                    prompt = build_cashout_prompt(
+                        match_info,
+                        cached_now["stats_df"],
+                        cached_now["events"],
+                        active_market,
+                        stake_input,
+                        orig_odds,
+                        cashout_offer,
+                    )
+                    st.success("Toca el ícono de copiar (arriba a la derecha de la caja) y pégalo en tu app de Gemini Pro:")
+                    st.code(prompt, language="markdown")
+                except Exception as e:
+                    st.error(f"Error al cargar estadísticas: {e}")
