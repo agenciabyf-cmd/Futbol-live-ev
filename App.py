@@ -1,4 +1,3 @@
-import time
 import streamlit as st
 import requests
 import pandas as pd
@@ -120,35 +119,23 @@ def build_match_context(match_info: dict, stats_df: pd.DataFrame | None, events:
 {events_text}"""
 
 
-def call_gemini_with_retry(prompt: str, max_retries: int = 3) -> str:
-    """Llama a Gemini con reintento automático ante saturación temporal (503/429)."""
-    client = genai.Client(api_key=GEMINI_API_KEY)
-    wait_times = [3, 6, 10]
-    last_error = None
-
-    for attempt in range(max_retries):
-        try:
-            response = client.models.generate_content(
-                model="gemini-3.8-flash",
-                contents=prompt,
-                config=types.GenerateContentConfig(temperature=0.2),
-            )
-            return response.text
-        except Exception as e:
-            last_error = e
-            error_msg = str(e).upper()
-            is_transient = any(code in error_msg for code in ("503", "UNAVAILABLE", "429", "OVERLOADED"))
-            if is_transient and attempt < max_retries - 1:
-                delay = wait_times[attempt]
-                st.toast(f"Servidor ocupado (503). Reintentando en {delay}s... ({attempt + 2}/{max_retries})")
-                time.sleep(delay)
-            else:
-                raise last_error
-
-    raise last_error
+def stream_gemini(prompt: str):
+    """Genera la respuesta de Gemini en streaming con timeout estricto de 25 segundos."""
+    client = genai.Client(
+        api_key=GEMINI_API_KEY,
+        http_options=types.HttpOptions(timeout=25000),
+    )
+    response_stream = client.models.generate_content_stream(
+        model="gemini-3.8-flash",
+        contents=prompt,
+        config=types.GenerateContentConfig(temperature=0.2),
+    )
+    for chunk in response_stream:
+        if chunk.text:
+            yield chunk.text
 
 
-def analyze_new_bet(
+def build_new_bet_prompt(
     match_info: dict,
     stats_df: pd.DataFrame | None,
     events: list,
@@ -156,11 +143,11 @@ def analyze_new_bet(
     odds: float,
     bankroll: int,
 ) -> str:
-    """Evalúa valor esperado (+EV) y stake Quarter-Kelly para una nueva entrada."""
+    """Construye el prompt para evaluar +EV y Quarter-Kelly."""
     context = build_match_context(match_info, stats_df, events)
     max_stake = int(bankroll * 0.03)
 
-    prompt = f"""Actúa como un analista cuantitativo de apuestas deportivas en vivo. Evalúa el siguiente partido con rigor matemático (sin inventar datos):
+    return f"""Actúa como un analista cuantitativo de apuestas deportivas en vivo. Evalúa el siguiente partido con rigor matemático (sin inventar datos):
 
 {context}
 
@@ -177,10 +164,9 @@ def analyze_new_bet(
    - Si $EV \\le 0\\%$, indica explícitamente **NO APOSTAR ($0 CLP)**.
    - Si $EV > 0\\%$, calcula el **Quarter-Kelly** (1/4 de Kelly) con tope estricto del **3% de la banca** (${max_stake:,} CLP) y entrega el monto exacto en CLP.
 """
-    return call_gemini_with_retry(prompt)
 
 
-def analyze_cashout(
+def build_cashout_prompt(
     match_info: dict,
     stats_df: pd.DataFrame | None,
     events: list,
@@ -189,11 +175,11 @@ def analyze_cashout(
     original_odds: float,
     cashout_offer: int,
 ) -> str:
-    """Evalúa matemáticamente si conviene cerrar (Cash Out) o mantener una apuesta activa."""
+    """Construye el prompt para evaluar Cash Out vs. mantener posición."""
     context = build_match_context(match_info, stats_df, events)
     potential_payout = int(round(stake * original_odds))
 
-    prompt = f"""Actúa como un analista cuantitativo de gestión de riesgo en apuestas deportivas en vivo. Evalúa si conviene tomar el Cash Out o mantener la posición activa:
+    return f"""Actúa como un analista cuantitativo de gestión de riesgo en apuestas deportivas en vivo. Evalúa si conviene tomar el Cash Out o mantener la posición activa:
 
 {context}
 
@@ -213,7 +199,22 @@ def analyze_cashout(
    - **Diferencia (Comisión implícita de la casa):** $\\text{{Hold EV}} - \\text{{Cash Out}}$ en CLP y porcentaje.
 4. **Veredicto Claro:** Indica explícitamente **MANTENER POSICIÓN** o **TOMAR CASH OUT**, justificando la decisión desde la esperanza matemática y el riesgo de varianza en los minutos finales.
 """
-    return call_gemini_with_retry(prompt)
+
+
+def ensure_stats_loaded(fixture_id: int) -> dict:
+    """Carga las estadísticas solo si no están ya guardadas para este partido."""
+    cached = st.session_state.get("cached_stats")
+    if cached is not None and cached["fixture_id"] == fixture_id:
+        return cached
+
+    stats_raw, events = get_match_details(fixture_id)
+    stats_df = format_stats_table(stats_raw)
+    st.session_state["cached_stats"] = {
+        "fixture_id": fixture_id,
+        "stats_df": stats_df,
+        "events": events,
+    }
+    return st.session_state["cached_stats"]
 
 
 # ================= INTERFAZ DE USUARIO =================
@@ -262,7 +263,6 @@ if "live_matches" in st.session_state and st.session_state["live_matches"]:
         "status": selected_match["fixture"]["status"]["short"],
     }
 
-    # Botón dedicado para refrescar estadísticas sin repetir gasto innecesario
     cached = st.session_state.get("cached_stats")
     has_current_stats = cached is not None and cached["fixture_id"] == fixture_id
 
@@ -290,7 +290,6 @@ if "live_matches" in st.session_state and st.session_state["live_matches"]:
 
     st.divider()
 
-    # Pestañas: Nueva Apuesta (+EV) y Evaluación de Cash Out
     tab_ev, tab_cashout = st.tabs(["📈 Nueva Apuesta (+EV)", "💰 Evaluar Cash Out"])
 
     with tab_ev:
@@ -315,33 +314,21 @@ if "live_matches" in st.session_state and st.session_state["live_matches"]:
             if not market_input.strip():
                 st.warning("Escribe el mercado que quieres evaluar antes de analizar.")
             else:
-                with st.spinner("Calculando probabilidades y valor esperado..."):
-                    try:
-                        # Si no se cargaron estadísticas aún, las obtiene automáticamente una sola vez
-                        if not has_current_stats:
-                            stats_raw, events = get_match_details(fixture_id)
-                            stats_df = format_stats_table(stats_raw)
-                            st.session_state["cached_stats"] = {
-                                "fixture_id": fixture_id,
-                                "stats_df": stats_df,
-                                "events": events,
-                            }
-                            if stats_df is not None:
-                                st.dataframe(stats_df, hide_index=True, use_container_width=True)
-
-                        cached_now = st.session_state["cached_stats"]
-                        analysis = analyze_new_bet(
-                            match_info,
-                            cached_now["stats_df"],
-                            cached_now["events"],
-                            market_input,
-                            odds_input,
-                            bankroll,
-                        )
-                        st.subheader("📈 Diagnóstico Cuantitativo")
-                        st.markdown(analysis)
-                    except Exception as e:
-                        st.error(f"Ocurrió un error en el análisis: {e}")
+                try:
+                    cached_now = ensure_stats_loaded(fixture_id)
+                    prompt = build_new_bet_prompt(
+                        match_info,
+                        cached_now["stats_df"],
+                        cached_now["events"],
+                        market_input,
+                        odds_input,
+                        bankroll,
+                    )
+                    st.subheader("📈 Diagnóstico Cuantitativo")
+                    st.write_stream(stream_gemini(prompt))
+                except Exception as e:
+                    st.error(f"Gemini no respondió a tiempo o está saturado: {e}")
+                    st.info("Tus estadísticas ya están guardadas en memoria. Espera 10 segundos y vuelve a tocar el botón sin gastar peticiones de API-Football.")
 
     with tab_cashout:
         active_market = st.text_input(
@@ -381,30 +368,19 @@ if "live_matches" in st.session_state and st.session_state["live_matches"]:
             if not active_market.strip():
                 st.warning("Indica cuál es tu apuesta activa antes de evaluar el Cash Out.")
             else:
-                with st.spinner("Evaluando riesgo y valor justo de cierre..."):
-                    try:
-                        if not has_current_stats:
-                            stats_raw, events = get_match_details(fixture_id)
-                            stats_df = format_stats_table(stats_raw)
-                            st.session_state["cached_stats"] = {
-                                "fixture_id": fixture_id,
-                                "stats_df": stats_df,
-                                "events": events,
-                            }
-                            if stats_df is not None:
-                                st.dataframe(stats_df, hide_index=True, use_container_width=True)
-
-                        cached_now = st.session_state["cached_stats"]
-                        co_analysis = analyze_cashout(
-                            match_info,
-                            cached_now["stats_df"],
-                            cached_now["events"],
-                            active_market,
-                            stake_input,
-                            orig_odds,
-                            cashout_offer,
-                        )
-                        st.subheader("💰 Diagnóstico de Cash Out")
-                        st.markdown(co_analysis)
-                    except Exception as e:
-                        st.error(f"Ocurrió un error al evaluar el Cash Out: {e}")
+                try:
+                    cached_now = ensure_stats_loaded(fixture_id)
+                    prompt = build_cashout_prompt(
+                        match_info,
+                        cached_now["stats_df"],
+                        cached_now["events"],
+                        active_market,
+                        stake_input,
+                        orig_odds,
+                        cashout_offer,
+                    )
+                    st.subheader("💰 Diagnóstico de Cash Out")
+                    st.write_stream(stream_gemini(prompt))
+                except Exception as e:
+                    st.error(f"Gemini no respondió a tiempo o está saturado: {e}")
+                    st.info("Tus estadísticas ya están guardadas en memoria. Espera 10 segundos y vuelve a tocar el botón sin gastar peticiones de API-Football.")
