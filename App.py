@@ -29,7 +29,12 @@ TOP_LEAGUES = {
 
 def get_live_fixtures(only_top_leagues: bool = True) -> list:
     """Obtiene los partidos en juego (consume 1 petición)."""
-    resp = requests.get(f"{BASE_URL}/fixtures", headers=HEADERS, params={"live": "all"}, timeout=15)
+    resp = requests.get(
+        f"{BASE_URL}/fixtures",
+        headers=HEADERS,
+        params={"live": "all"},
+        timeout=15,
+    )
     resp.raise_for_status()
     matches = resp.json().get("response", [])
 
@@ -41,10 +46,16 @@ def get_live_fixtures(only_top_leagues: bool = True) -> list:
 def get_match_details(fixture_id: int) -> tuple[list, list]:
     """Obtiene estadísticas y eventos clave de un partido (consume 2 peticiones)."""
     stats_resp = requests.get(
-        f"{BASE_URL}/fixtures/statistics", headers=HEADERS, params={"fixture": fixture_id}, timeout=15
+        f"{BASE_URL}/fixtures/statistics",
+        headers=HEADERS,
+        params={"fixture": fixture_id},
+        timeout=15,
     )
     events_resp = requests.get(
-        f"{BASE_URL}/fixtures/events", headers=HEADERS, params={"fixture": fixture_id}, timeout=15
+        f"{BASE_URL}/fixtures/events",
+        headers=HEADERS,
+        params={"fixture": fixture_id},
+        timeout=15,
     )
     stats_resp.raise_for_status()
     events_resp.raise_for_status()
@@ -85,11 +96,17 @@ def format_stats_table(stats_raw: list) -> pd.DataFrame | None:
     return pd.DataFrame(rows)
 
 
-def analyze_with_gemini(match_info: dict, stats_df: pd.DataFrame | None, events: list, market: str, odds: float, bankroll: int) -> str:
+def analyze_with_gemini(
+    match_info: dict,
+    stats_df: pd.DataFrame | None,
+    events: list,
+    market: str,
+    odds: float,
+    bankroll: int,
+) -> str:
     """Envía el contexto real del partido a Gemini para el análisis cuantitativo."""
     client = genai.Client(api_key=GEMINI_API_KEY)
 
-    # Filtrar solo goles y tarjetas rojas para no saturar el prompt
     key_events = [
         f"Min {e['time']['elapsed']}' - {e['team']['name']}: {e['type']} ({e['detail']}) - {e['player']['name']}"
         for e in events
@@ -129,7 +146,6 @@ Actúa como un analista cuantitativo de apuestas deportivas en vivo. Evalúa el 
 
     response = client.models.generate_content(
         model="gemini-3.8-flash",
-,
         contents=prompt,
         config=types.GenerateContentConfig(temperature=0.2),
     )
@@ -139,15 +155,13 @@ Actúa como un analista cuantitativo de apuestas deportivas en vivo. Evalúa el 
 # ================= INTERFAZ DE USUARIO =================
 st.title("⚽ Analizador Live +EV")
 
-# Configuración de Bankroll y Filtro
 col1, col2 = st.columns(2)
 with col1:
     bankroll = st.number_input("Bankroll (CLP)", min_value=1000, value=100000, step=5000)
 with col2:
-    st.write("")  # Espaciado visual
+    st.write("")
     only_top = st.toggle("Solo Ligas Top", value=True)
 
-# Botón manual para evitar gasto innecesario de cuota API
 if st.button("🔄 Cargar partidos en vivo", use_container_width=True):
     with st.spinner("Consultando API-Football..."):
         try:
@@ -157,7 +171,6 @@ if st.button("🔄 Cargar partidos en vivo", use_container_width=True):
         except Exception as e:
             st.error(f"Error al consultar API-Football: {e}")
 
-# Selector de partido si ya hay partidos cargados
 if "live_matches" in st.session_state and st.session_state["live_matches"]:
     matches = st.session_state["live_matches"]
 
@@ -175,7 +188,6 @@ if "live_matches" in st.session_state and st.session_state["live_matches"]:
 
     st.divider()
 
-    # Datos de la apuesta en tu casa
     c1, c2 = st.columns([2, 1])
     with c1:
         market_input = st.text_input("Mercado a evaluar", placeholder="Ej: Más de 2.5 goles, Gana Local, Cash Out...")
